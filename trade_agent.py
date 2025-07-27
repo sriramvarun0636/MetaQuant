@@ -13,6 +13,7 @@ SYMBOLS = ['NIFTY', 'BANKNIFTY']
 INDEX_DETAILS = {"NIFTY": 50, "BANKNIFTY": 15}
 STARTING_CAPITAL = 1_000_000.0
 BROKERAGE_PER_TRADE = 40.0
+MINIMUM_OPTION_RISK_POINTS = 1.0 
 
 PORTFOLIO_PARAMS = {
     'strategy_allocation': {'AP_Trend': 1.0, 'SMC_OB': 1.0, 'MR_Reversal': 1.0},
@@ -34,7 +35,7 @@ ADAPTIVE_PARAMS = {
     'adx_score_threshold': 35
 }
 
-logging.basicConfig(filename='apex_adaptive.log', level=logging.INFO, filemode='w', format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename='meta_quant.log', level=logging.INFO, filemode='w', format='%(asctime)s - %(levelname)s - %(message)s')
 
 def kite_login():
     class MockKiteConnect:
@@ -43,7 +44,9 @@ def kite_login():
         def historical_data(self, token, from_dt, to_dt, interval):
             start, end = pd.to_datetime(from_dt).tz_localize(IST), pd.to_datetime(to_dt).tz_localize(IST)
             freq = 'B' if interval == 'day' else 'min'; index = pd.date_range(start, end, freq=freq, name='date')
-            if interval == 'minute': index = index[(index.time >= datetime.time(9, 15)) & (index.time <= datetime.time(15, 30))]
+            if interval == 'minute':
+                valid_times = index.indexer_between_time("09:15", "15:30")
+                index = index[valid_times]
             if index.empty: return []
             count = len(index); base_price = 22000 if 'NIFTY' in str(token) else 48000
             if 'OPT' in str(token): base_price = 200
@@ -121,9 +124,12 @@ def get_signal_score(signal, features_row):
     if 'SMC_OB' in reason:
         return 3
     if 'MR_Reversal' in reason:
-        dist = abs(features_row['close'] - features_row['bb_ma']) / features_row['bb_std']
-        return 3 if dist > 2.5 else 2 
-    return 1 
+        bb_std = features_row.get('bb_std', 0)
+        if bb_std > 0:
+            dist = abs(features_row['close'] - features_row['bb_ma']) / bb_std
+            return 3 if dist > 2.5 else 2
+        return 2 
+    return 1
 
 class StrategyBase:
     def __init__(self, params): self.params = params
@@ -135,8 +141,14 @@ class AlphaPredatorStrategy(StrategyBase):
         if len(df) < 200: return pd.DataFrame()
         df = calculate_atr(df); df['ema_50'] = df['close'].ewm(span=50).mean(); df['ema_200'] = df['close'].ewm(span=200).mean()
         up, down = df['high'].diff(), -df['low'].diff(); plus_dm = np.where((up > down) & (up > 0), up, 0.0); minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-        tr14 = df['atr_14'].rolling(14).sum(); plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(14).sum() / tr14; minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(14).sum() / tr14
-        df['adx_14'] = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di)).rolling(14).mean()
+        tr14 = df['atr_14'].rolling(14).sum()
+        plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(14).sum() / tr14
+        minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(14).sum() / tr14
+
+        adx_denominator = (plus_di + minus_di)
+        adx_raw = abs(plus_di - minus_di) / adx_denominator.replace(0, np.nan) 
+        df['adx_14'] = 100 * adx_raw.ewm(span=14, adjust=False).mean() 
+        
         return df.dropna()
 
     def generate_signals(self, df, trend_regime):
@@ -203,17 +215,17 @@ class PortfolioManager:
 
     def calculate_position_size(self, entry_px, sl_px, lot_size, strategy_name, score, vol_modifier):
         risk_per_lot = abs(entry_px - sl_px) * lot_size
-        if risk_per_lot <= 0: return 1
+        if risk_per_lot <= 0: return 0 # Return 0 lots if risk is zero or negative
         allocation = self.params['strategy_allocation'].get(strategy_name, 1.0)
         score_modifier = ADAPTIVE_PARAMS['score_risk_multipliers'].get(score, 1.0)
         rupee_risk = (self.capital * self.params['risk_per_trade_percent']) * allocation * score_modifier * vol_modifier
         lots = int(rupee_risk // risk_per_lot)
-        return max(lots, 1)
+        return max(lots, 0) # Can be 0, to be checked later
 
     def on_fill(self, trade_info): self.trades_today += 1; self.trade_log.append(trade_info)
     def on_exit(self, pnl): self.daily_pnl += pnl; self.capital += pnl
 
-def run_apex_backtest(start_date, end_date):
+def run_meta_quant_backtest(start_date, end_date):
     kite = kite_login(); nfo = fetch_instruments(kite)
     if nfo.empty: return pd.DataFrame(), pd.DataFrame()
 
@@ -274,7 +286,9 @@ def run_apex_backtest(start_date, end_date):
                 entry_row = opt_df.iloc[entry_idx]; entry_px = entry_row['open']; side = 1 if signal['type'] == 'CE' else -1
                 option_delta = get_option_delta_approx(signal['type'], signal['entry_price_fut'], strike)
                 strat_params = strategies[signal['reason'].split('_')[0] + ('Predator' if 'AP' in signal['reason'] or 'SMC' in signal['reason'] else 'Reversion')].params
-                risk_fut = signal['atr'] * strat_params['sl_atr_mult']; risk_opt = risk_fut * option_delta
+                
+                risk_fut = signal['atr'] * strat_params['sl_atr_mult']
+                risk_opt = max(risk_fut * option_delta, MINIMUM_OPTION_RISK_POINTS)
                 
                 sl_px = entry_px - (risk_opt * side); tp_px = entry_px + (risk_opt * strat_params['rr_ratio'] * side)
                 
@@ -284,8 +298,8 @@ def run_apex_backtest(start_date, end_date):
                 portfolio.on_fill({'symbol': symbol, 'entry_time': entry_row.name})
                 entry_px_adj = entry_px * (1 + slippage_factor); exit_price_adj = 0
                 exit_price, exit_time, reason = entry_px_adj, entry_row.name, 'EOD'
+                trade_df = opt_df[opt_df.index >= entry_row.name]
                 
-                trade_df = opt_df.loc[entry_row.name:]
                 for k in range(1, len(trade_df)):
                     candle = trade_df.iloc[k]
                     sl_hit = (side == 1 and candle['low'] <= sl_px) or (side == -1 and candle['high'] >= sl_px)
@@ -304,7 +318,7 @@ def run_apex_backtest(start_date, end_date):
 
     trades_df = pd.DataFrame(all_trades); equity_df = pd.DataFrame(equity_curve)
     
-    print("\n--- FULLY ADAPTIVE BACKTEST COMPLETE ---")
+    print("\n--- META QUANT BACKTEST COMPLETE ---")
     print("Enhancements: Signal Scoring, Volatility Regimes, Adaptive Sizing & Strikes, Pyramiding Enabled")
     if not trades_df.empty:
         final_capital = equity_df['capital'].iloc[-1] if not equity_df.empty else STARTING_CAPITAL
@@ -315,7 +329,7 @@ def run_apex_backtest(start_date, end_date):
         print("\n--- Performance by Volatility Regime ---"); print(trades_df.groupby('vol_regime')['pnl'].agg(['sum', 'count', 'mean']))
         
         if not equity_df.empty:
-            equity_df.set_index('date')['capital'].plot(figsize=(12,6), title="Fully Adaptive Equity Curve")
+            equity_df.set_index('date')['capital'].plot(figsize=(12,6), title="Meta Quant Adaptive Equity Curve")
             plt.grid(True); plt.ylabel("Capital (₹)"); plt.xlabel("Date"); plt.show()
     else: print("No trades were generated.")
     return trades_df, equity_df
@@ -323,5 +337,5 @@ def run_apex_backtest(start_date, end_date):
 if __name__ == "__main__":
     start = datetime.date.today() - datetime.timedelta(days=90)
     end = datetime.date.today() - datetime.timedelta(days=1)
-    trades, equity = run_apex_backtest(start, end)
-    if not trades.empty: trades.to_csv("apex_adaptive_trades.csv", index=False)
+    trades, equity = run_meta_quant_backtest(start, end)
+    if not trades.empty: trades.to_csv("meta_quant_trades.csv", index=False)
